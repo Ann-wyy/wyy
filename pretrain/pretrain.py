@@ -23,6 +23,8 @@ from dinov2.train.ssl_meta_arch import SSLMetaArch
 from npz_dataset import NPZDataset
 from safetensors import safe_open
 from safetensors.torch import load_file
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP,StateDictType
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
 import logging
 
@@ -145,26 +147,8 @@ def do_train(cfg, model, resume=False):
     ) = build_schedulers(cfg)
 
     checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer,fp16_scaler=model.fp16_scaler, save_to_disk=True)
-    logger.info(f"Resume ------------- {resume}")
-    if resume:
-        # 恢复训练：使用 checkpointer 加载完整状态（模型、优化器、iteration）
-        loaded_state = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=True)
-        start_iter = loaded_state.get("iteration", -1) + 1
-        logger.info(f"Resuming training from iteration {start_iter}")
-    else:
-        logger.info("Loading pretrained weights from hardcoded path: /home/yyi/X_ray/weight/rad_dino.pth")
-        checkpoint = torch.load("/home/yyi/X_ray/weight/rad_dino.pth", map_location="cpu")
-        if "model" in checkpoint:
-            state_dict = checkpoint["model"]
-        elif "state_dict" in checkpoint:
-            state_dict = checkpoint["state_dict"]
-        else:
-            state_dict = checkpoint
-        model.load_state_dict(state_dict, strict=False)
-        logger.info("Successfully loaded pretrained weights.")
-        start_iter = 0
 
-    # start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
+    start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
 
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
@@ -337,8 +321,19 @@ def train(rank, world_size, config):
         # 构建模型
         model = SSLMetaArch(config).to(torch.device("cuda"))
 
-        # ... (模型加载代码, 这里你已经有try-except，可以保留)
+        student_backbone = model.student.backbone
 
+        # 3. 加载预训练权重
+        checkpoint = torch.load("/home/yyi/X_ray/weight/rad_dino.pth", map_location="cpu")
+        if "model" in checkpoint:
+            state_dict = checkpoint["model"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        student_backbone.load_state_dict(state_dict, strict=False)
+        logger.info("Successfully loaded pretrained weights into model.student.backbone.")
         model.prepare_for_distributed_training()
 
         # 执行训练
