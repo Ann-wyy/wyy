@@ -1,5 +1,5 @@
 import os
-from random import random
+import random
 import sys
 sys.path.insert(0, "/data/truenas_B2/yyi/dinov2")
 sys.path.insert(0, "/data/truenas_B2/yyi/dinov3_pretrain")
@@ -31,7 +31,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 
 # ================================导入工具函数====================================
-from utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
+from metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
  
 # --- 配置参数 ---
 TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
@@ -66,6 +66,26 @@ LOG_DIR = f"/data/truenas_B2/yyi/logs/{TRAIN_NAME}/{TEST_NAME}"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILENAME = os.path.join(LOG_DIR, f"{TEST_NAME}_{time.strftime('%Y%m%d-%H%M%S')}.log")
 
+def set_seed(seed):
+    """设置所有必要的随机种子"""
+    # Python 内建的随机数
+    random.seed(seed)
+
+    # NumPy
+    np.random.seed(seed)
+
+    # PyTorch
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        # GPU (CUDA) 种子
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        # 强制 CUDA 禁用非确定性算法，确保结果完全一致
+        # 但可能会轻微降低一些性能
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 set_seed(RANDOM_SEED) # 设置随机种子
 
 def setup_logging():
@@ -84,26 +104,6 @@ def setup_logging():
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
 logger = setup_logging() # 初始化全局日志记录器
 logger.info(f"随机种子: {RANDOM_SEED}")
-
-def set_seed(seed):
-    """设置所有必要的随机种子"""
-    # Python 内建的随机数
-    random.seed(seed)
-    
-    # NumPy
-    np.random.seed(seed)
-    
-    # PyTorch
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        # GPU (CUDA) 种子
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed) 
-        
-        # 强制 CUDA 禁用非确定性算法，确保结果完全一致
-        # 但可能会轻微降低一些性能
-        torch.backends.cudnn.deterministic = True 
-        torch.backends.cudnn.benchmark = False
 
 from collections import OrderedDict
 class MultiTaskImageDatasetFromDataFrame(Dataset):
@@ -275,12 +275,14 @@ def train_multi_task_classifier(logger: logging.Logger):
 
     # 读取数据集
     df = pd.read_csv(CSV_PATH)
+    stratify_col = df[LABEL_COLUMNS].astype(str).agg('_'.join, axis=1)
     train_df, temp_df = train_test_split(
-        df, test_size=0.3, random_state=42, stratify=df[LABEL_COLUMNS]  # stratify 保持类别分布
+        df, test_size=0.3, random_state=42, stratify=stratify_col  # stratify 保持类别分布
     )
 
+    temp_stratify_col = temp_df[LABEL_COLUMNS].astype(str).agg('_'.join, axis=1)
     val_df, test_df = train_test_split(
-        temp_df, test_size=0.5, random_state=42, stratify=temp_df[LABEL_COLUMNS] 
+        temp_df, test_size=0.5, random_state=42, stratify=temp_stratify_col
     )
 
     train_df = train_df.reset_index(drop=True)
@@ -431,7 +433,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             combined_loss = torch.tensor(0.0, device=DEVICE)
             train_paths_all.extend(img_paths)
 
-            with torch.amp.autocast(device_type=DEVICE):
+            with torch.amp.autocast(device_type='cuda'):
                 predictions_dict = model(pixel_values)
                 for task_name in model.task_names:
                     logits = predictions_dict[task_name]  # shape: (batch_size, 1)
@@ -455,8 +457,8 @@ def train_multi_task_classifier(logger: logging.Logger):
 
                         
                         task_loss = task_criterion(valid_logits, target)
-                        # 计算全部样本的概率 (用于指标统计)
-                        probs_pos = torch.sigmoid(valid_logits).squeeze(1)
+                        # 计算全部样本的概率 (用于指标统计)，需用完整 logits 保持与 labels 长度一致
+                        probs_pos = torch.sigmoid(logits).squeeze(1)
                         probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1)
                     else:
                         target = valid_labels.long() 
