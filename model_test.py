@@ -133,11 +133,8 @@ class MultiTaskImageDatasetFromDataFrame(Dataset):
         if is_training:
             self.transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
-                T.RandomVerticalFlip(p=0.3),
-                T.RandomRotation(degrees=20),
-                T.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=5),
-                T.ColorJitter(brightness=0.2, contrast=0.2),
-                T.RandomErasing(p=0.2, scale=(0.02, 0.1)),
+                T.RandomRotation(degrees=15),
+                T.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=0),
             ])
         else:
             self.transform = None
@@ -236,12 +233,7 @@ class DinoV3MultiTaskClassifier(nn.Module):
             else:
                 logger.warning(f"任务 '{task_name}' 的类别数 {num_classes} 无效。设置为 1。")
                 output_dim = 1
-            self.classifiers[task_name] = nn.Sequential(
-                nn.Linear(feature_dim, feature_dim // 2),
-                nn.GELU(),
-                nn.Dropout(p=0.3),
-                nn.Linear(feature_dim // 2, output_dim)
-            )
+            self.classifiers[task_name] = nn.Linear(feature_dim, output_dim)
 
         # 确保分类头参数是可训练的
         for name in self.classifiers:
