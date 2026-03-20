@@ -1,4 +1,5 @@
 import os
+from random import random
 import sys
 sys.path.insert(0, "/data/truenas_B2/yyi/dinov2")
 sys.path.insert(0, "/data/truenas_B2/yyi/dinov3_pretrain")
@@ -30,8 +31,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 
 # ================================导入工具函数====================================
-from utils.utils import set_seed, convert_dinov3_teacher_to_hf_state_dict, preprocess_labels_and_setup_datasets
-from utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate, run_test_and_save_predictions
+from utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
  
 # --- 配置参数 ---
 TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
@@ -85,7 +85,27 @@ def setup_logging():
 logger = setup_logging() # 初始化全局日志记录器
 logger.info(f"随机种子: {RANDOM_SEED}")
 
+def set_seed(seed):
+    """设置所有必要的随机种子"""
+    # Python 内建的随机数
+    random.seed(seed)
+    
+    # NumPy
+    np.random.seed(seed)
+    
+    # PyTorch
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        # GPU (CUDA) 种子
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) 
+        
+        # 强制 CUDA 禁用非确定性算法，确保结果完全一致
+        # 但可能会轻微降低一些性能
+        torch.backends.cudnn.deterministic = True 
+        torch.backends.cudnn.benchmark = False
 
+from collections import OrderedDict
 class MultiTaskImageDatasetFromDataFrame(Dataset):
     def __init__(self, df: pd.DataFrame, img_col: str, label_cols: List[str], 
                  size: int, logger: logging.Logger, is_training: bool = False):
