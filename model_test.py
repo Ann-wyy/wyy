@@ -36,7 +36,7 @@ from metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
 # --- 配置参数 ---
 TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
 BATCH_SIZE = 256
-LEARNING_RATE = 0.01
+LEARNING_RATE = 1e-3
 NUM_EPOCHS = 100
 PATIENCE = 10 # 早停耐心值
 RANDOM_SEED = 42 # 42, 100, 601, 1010, 2025
@@ -133,8 +133,11 @@ class MultiTaskImageDatasetFromDataFrame(Dataset):
         if is_training:
             self.transform = T.Compose([
                 T.RandomHorizontalFlip(p=0.5),
-                T.RandomRotation(degrees=15),
-                T.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=0),
+                T.RandomVerticalFlip(p=0.3),
+                T.RandomRotation(degrees=20),
+                T.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=5),
+                T.ColorJitter(brightness=0.2, contrast=0.2),
+                T.RandomErasing(p=0.2, scale=(0.02, 0.1)),
             ])
         else:
             self.transform = None
@@ -233,7 +236,12 @@ class DinoV3MultiTaskClassifier(nn.Module):
             else:
                 logger.warning(f"任务 '{task_name}' 的类别数 {num_classes} 无效。设置为 1。")
                 output_dim = 1
-            self.classifiers[task_name] = nn.Linear(feature_dim, output_dim)
+            self.classifiers[task_name] = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim // 2),
+                nn.GELU(),
+                nn.Dropout(p=0.3),
+                nn.Linear(feature_dim // 2, output_dim)
+            )
 
         # 确保分类头参数是可训练的
         for name in self.classifiers:
@@ -394,13 +402,13 @@ def train_multi_task_classifier(logger: logging.Logger):
     # 初始化 GradScaler
     scaler = torch.amp.GradScaler('cuda')
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
+        optimizer,
         mode='max',                 # 监控分数，所以使用 'max'
-        factor=0.1,                 # 降低到原来的 10%
-        patience=10,               # 多少个 epoch 不改善后触发
-        min_lr=1e-4             # 学习率下限
+        factor=0.5,                 # 每次降低到原来的 50%，避免一下子降太猛
+        patience=5,                 # 比早停耐心值小，给低 LR 精调留空间
+        min_lr=1e-6                 # 足够低，允许充分精调
     )
-    logger.info(f"学习率调度器 ReduceLROnPlateau 已初始化，监控模式: max, 降低耐心值: 10")
+    logger.info(f"学习率调度器 ReduceLROnPlateau 已初始化，监控模式: max, 降低耐心值: 5")
 
     logger.info(f"模型已加载，在设备 {DEVICE} 上训练...")
 
@@ -507,13 +515,15 @@ def train_multi_task_classifier(logger: logging.Logger):
         val_metrics = evaluate(
             model, val_loader, criterion_dict, model.task_names, num_classes_dict, DEVICE, mode='val', logger=logger
         )
-        # log_metrics_to_tensorboard(writer, val_metrics, epoch + 1, 'Val', logger)
-        key_task = model.task_names[0]
-        val_score = val_metrics[key_task]['auroc']
-        # === 新增：学习率调度器步进 ===
-        scheduler.step(val_score) 
+        log_metrics_to_tensorboard(writer, val_metrics, epoch + 1, 'Val', logger)
+        # 用所有任务的平均 AUROC 作为早停指标，避免只盯着一个任务
+        auroc_values = [val_metrics[t]['auroc'] for t in model.task_names if val_metrics[t]['auroc'] > 0]
+        val_score = float(np.mean(auroc_values)) if auroc_values else 0.0
+        logger.info(f"所有任务平均 Val AUROC: {val_score:.4f}")
+        # === 学习率调度器步进 ===
+        scheduler.step(val_score)
         current_lr = optimizer.param_groups[0]['lr']
-        logger.info(f"当前学习率 (LR): {current_lr:.4f}")
+        logger.info(f"当前学习率 (LR): {current_lr:.2e}")
         if val_score > best_val_score:
             best_val_score = val_score
             patience_counter = 0
