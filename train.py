@@ -28,11 +28,11 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 from collections import defaultdict
 import nibabel as nib
+import random
 from sklearn.model_selection import KFold
 from sklearn.metrics import confusion_matrix
 
 # ================================导入工具函数====================================
-from utils import set_seed, convert_dinov3_teacher_to_hf_state_dict, preprocess_labels_and_setup_datasets
 from metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
 from MLP_ReLU import MultiTaskImageDatasetFromDataFrame, ClinicalEncoder, MultiTaskClassifier, DinoV3MultiTaskClassifier
 from config import (
@@ -43,6 +43,25 @@ from config import (
     LOAD_LOCAL_CHECKPOINT, TEST_NAME, LOCAL_CHECKPOINT_PATH, CFG_PATH,
     IGNORE_INDEX, LOG_DIR, LOG_FILENAME
 )
+def set_seed(seed):
+    """设置所有必要的随机种子"""
+    # Python 内建的随机数
+    random.seed(seed)
+    
+    # NumPy
+    np.random.seed(seed)
+    
+    # PyTorch
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        # GPU (CUDA) 种子
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) 
+        
+        # 强制 CUDA 禁用非确定性算法，确保结果完全一致
+        # 但可能会轻微降低一些性能
+        torch.backends.cudnn.deterministic = True 
+        torch.backends.cudnn.benchmark = False
 
 set_seed(RANDOM_SEED) # 设置随机种子
 
