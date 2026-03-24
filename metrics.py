@@ -43,6 +43,8 @@ def calculate_metrics(
     valid_labels = all_labels[valid_indices]
     valid_preds = all_preds[valid_indices]
     valid_probs = all_probs[valid_indices]
+    if np.isnan(valid_probs).any():
+        logger.warning(f"{task_name} {mode} prob contains NaN")
     if len(valid_labels) == 0:
         logger.warning(f"任务 {task_name} 中没有有效标签 (>=0) 的样本，跳过指标计算。")
         return {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'auroc': 0.0, 'auprc': 0.0}
@@ -84,120 +86,99 @@ def calculate_metrics(
 
         
 # --- 辅助函数：评估流程 ---
-def evaluate(
-    model,
-    data_loader,
-    criterion_dict,
-    task_names,
-    num_classes_dict,
-    device,
-    mode,
-    logger
-):
+def evaluate(model, data_loader, criterion_dict, task_names, num_classes_dict, device, mode, logger):
     model.eval()
-
+    total_combined_loss = 0
+    task_paths = {task: [] for task in task_names}
+    task_pred_probs = {task: [] for task in task_names}  # 记录预测置信度
     task_labels = {task: [] for task in task_names}
     task_probs = {task: [] for task in task_names}
-
-    total_combined_loss = 0.0
-    total_steps = 0
+    task_counts = {task: 0 for task in task_names}
 
     with torch.no_grad():
         for batch in data_loader:
             if batch is None:
                 continue
-
-            pixel_values, labels_dict, img_paths = batch
-            if pixel_values is None or pixel_values.numel() == 0:
-                continue
-
+            
+            pixel_values, clinical_values, labels_dict, img_paths = batch
             pixel_values = pixel_values.to(device)
+            clinical_values = clinical_values.to(device)
 
-            predictions_dict = model(pixel_values)
-            combined_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+            predictions_dict = model(pixel_values, clinical_values)
+            combined_loss = 0
 
             for task_name in task_names:
                 labels = labels_dict[task_name].to(device)
                 predictions = predictions_dict[task_name]
-                num_cls = int(num_classes_dict.get(task_name, 2))
+                num_cls = num_classes_dict.get(task_name)
                 task_criterion = criterion_dict[task_name]
+                task_paths[task_name].extend(img_paths)
 
-                # --- 统一 shape ---
-                # labels: [B] / [B,1] -> [B]
-                labels = labels.view(-1)
-
-                # predictions:
-                # multi-class -> [B,C]
-                # binary -> [B] or [B,1] -> [B]
-                if num_cls <= 2:
-                    predictions = predictions.view(-1)
-
-                # --- loss: 只对 labels != -1 的样本计算 ---
                 valid_mask = (labels != -1)
-                valid_count = int(valid_mask.sum().item())
-
+                valid_count = valid_mask.sum()
+                
                 task_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                if torch.isnan(predictions).any():
+                    logger.warning(f"{task_name} logits contain NaN")
 
                 if valid_count > 0:
+                    valid_labels = labels[valid_mask]
+                    valid_predictions = predictions[valid_mask]
+
                     if num_cls > 2:
-                        # 多分类
-                        valid_labels = labels[valid_mask].long()  # [N]
-                        valid_predictions = predictions[valid_mask]  # [N,C]
-                        task_loss = task_criterion(valid_predictions, valid_labels)
+                        # 多分类任务
+                        target = valid_labels.long() 
+                        # 计算损失 (使用过滤后的标签和预测)
+                        task_loss = task_criterion(valid_predictions, target)
+                        
                     else:
-                        # 二分类 BCEWithLogitsLoss
-                        valid_labels = labels[valid_mask].float()  # [N]
-                        valid_predictions = predictions[valid_mask].float()  # [N]
-                        task_loss = task_criterion(valid_predictions, valid_labels)
-
-                combined_loss = combined_loss + task_loss
-
-                # --- probabilities: 用全 batch 的 predictions（后续会按 labels 过滤） ---
-                if num_cls > 2:
-                    probabilities = torch.softmax(predictions, dim=1)  # [B,C]
+                        # --- 二分类：BCEWithLogitsLoss ---
+                        target = valid_labels.float().view(-1, 1)
+                        # 计算损失 (使用过滤后的标签和预测)
+                        task_loss = task_criterion(valid_predictions, target)
+                combined_loss += task_loss
+                
+                if num_cls and num_cls > 2:
+                    probabilities = torch.softmax(predictions, dim=1)
                 else:
-                    probs_pos = torch.sigmoid(predictions)  # [B]
-                    probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1)  # [B,2]
+                    probs_pos = torch.sigmoid(predictions).squeeze(1)
+                    # 形状 [N, 2]
+                    probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1)
 
-                task_probs[task_name].extend(probabilities.detach().cpu().tolist())
-                task_labels[task_name].extend(labels.detach().cpu().tolist())
+                max_probs = probabilities.max(dim=1).values
+                task_pred_probs[task_name].extend(max_probs.cpu().tolist())
+                task_probs[task_name].extend(probabilities.cpu().tolist())
+                # 注意：这里收集的 labels 仍然包含 -1，后续由 calculate_metrics 函数处理过滤
+                task_labels[task_name].extend(labels.cpu().tolist())
+                
+            total_combined_loss += combined_loss.item()
 
-            total_combined_loss += float(combined_loss.item())
-            total_steps += 1
 
-    # ===== 计算指标 =====
+    # 计算评估指标 (例如：Accuracy, F1 Score)
     task_metrics = {}
+     # 假设已安装 sklearn
+    
     for task_name in task_names:
+        # 使用无偏的、不加权的评估
         true_labels = task_labels[task_name]
         probabilities = task_probs[task_name]
+        
+        if len(true_labels) > 0:
+            num_cls = num_classes_dict[task_name]
+            metrics = calculate_metrics(
+                all_labels=true_labels,
+                all_probs=probabilities,
+                num_classes=num_cls,
+                task_name=task_name,
+                mode=f'{mode}_{task_name}',
+                logger=logger
+            )
+            task_metrics[task_name] = metrics
+        else:
+            task_metrics[task_name] = {'accuracy': 0.0, 'f1': 0.0, 'auroc': float('nan'), 'auprc': float('nan')}
 
-        if len(true_labels) == 0:
-            task_metrics[task_name] = {
-                'accuracy': 0.0,
-                'precision': 0.0,
-                'recall': 0.0,
-                'f1': 0.0,
-                'auroc': 0.0,
-                'auprc': 0.0
-            }
-            continue
-
-        num_cls = int(num_classes_dict.get(task_name, 2))
-        metrics = calculate_metrics(
-            all_labels=true_labels,
-            all_probs=probabilities,
-            num_classes=num_cls,
-            task_name=task_name,
-            mode=f'{mode}_{task_name}',
-            logger=logger
-        )
-        task_metrics[task_name] = metrics
-
-    avg_loss = total_combined_loss / max(total_steps, 1)
-    logger.info(f"[{mode}] Combined Loss (avg per step): {avg_loss:.6f}")
-
-    return task_metrics
-
+    # 返回所有结果
+    return task_metrics, task_paths, task_labels, task_probs, task_pred_probs
 
 
 # --- 辅助函数：TensorBoard 记录 ---
@@ -250,187 +231,4 @@ def log_metrics_to_tensorboard(
             average_metrics[key] = float('nan')
     
 
-
-def run_test_and_save_predictions(
-    model,
-    test_loader,
-    task_name: str,
-    num_classes_dict,
-    device,
-    test_df: pd.DataFrame,
-    save_dir: str,
-    logger: logging.Logger,
-    is_save: bool = False,
-    img_col: str = "image_path",
-):
-    """
-    1) 对 test_loader 跑推理
-    2) 保存逐图像预测结果 (image-level)
-    3) 再按 patient_id 聚合为病人级结果 (patient-level)
-    4) 计算病人级指标
-
-    ✅ 支持多任务：所有输出列名都带 task_name 前缀，避免覆盖
-    """
-
-    model.eval()
-
-    # ============ 检查任务类别数 ============
-    num_cls = int(num_classes_dict.get(task_name, 2))
-    if num_cls != 2:
-        raise ValueError(
-            f"run_test_and_save_predictions 当前只支持二分类，但 {task_name} num_classes={num_cls}"
-        )
-
-    # ============ image-level 收集 ============
-    all_image_paths = []
-    all_gt = []
-    all_prob = []
-    all_pred = []
-
-    with torch.no_grad():
-        for batch in test_loader:
-            if batch is None:
-                continue
-
-            pixel_values, labels_dict, img_paths = batch
-
-            if pixel_values is None or pixel_values.numel() == 0:
-                continue
-            if img_paths is None or len(img_paths) == 0:
-                continue
-
-            pixel_values = pixel_values.to(device)
-
-            if task_name not in labels_dict:
-                raise KeyError(
-                    f"❌ labels_dict 缺少任务 {task_name}，现有 keys={list(labels_dict.keys())}"
-                )
-
-            labels = labels_dict[task_name].to(device).view(-1)  # [B]
-
-            logits_dict = model(pixel_values)
-
-            if task_name not in logits_dict:
-                raise KeyError(
-                    f"❌ logits_dict 缺少任务 {task_name}，现有 keys={list(logits_dict.keys())}"
-                )
-
-            logits = logits_dict[task_name].view(-1)  # [B]
-
-            probs_pos = torch.sigmoid(logits)  # [B]
-            preds = (probs_pos >= 0.5).long()  # [B]
-
-            all_image_paths.extend(list(img_paths))
-            all_gt.extend(labels.detach().cpu().tolist())
-            all_prob.extend(probs_pos.detach().cpu().tolist())
-            all_pred.extend(preds.detach().cpu().tolist())
-
-    # ============ image-level dataframe (列名带任务前缀) ============
-    gt_col = f"{task_name}_gt"
-    pred_col = f"{task_name}_pred"
-    prob_col = f"{task_name}_prob"
-
-    pred_df = pd.DataFrame({
-        "image_path": all_image_paths,
-        gt_col: all_gt,
-        prob_col: all_prob,
-        pred_col: all_pred,
-    })
-
-    # ============ merge patient_id ============
-    if "patient_id" not in test_df.columns:
-        raise ValueError("❌ test_df 缺少 patient_id 列，请确认预处理是否保留了 patient_id")
-
-    if img_col not in test_df.columns:
-        raise ValueError("❌ test_df 缺少 image_path 列，无法 merge")
-
-    meta_df = test_df[[img_col, "patient_id"]].copy()
-    meta_df = meta_df.drop_duplicates(subset=[img_col], keep="first")
-
-    pred_df = pred_df.merge(meta_df, on=img_col, how="left")
-
-    missing_pid = int(pred_df["patient_id"].isna().sum())
-    if missing_pid > 0:
-        logger.error(f"❌ merge 后有 {missing_pid} 张图没有匹配到 patient_id（image_path 不一致）")
-        logger.error("示例（前10个）：")
-        logger.error(pred_df[pred_df["patient_id"].isna()][img_col].head(10).tolist())
-        raise ValueError("merge 失败：image_path 与 test_df 不一致，导致 patient_id 缺失")
-
-    # ============ 保存逐图像结果 ============
-    if is_save:
-        os.makedirs(save_dir, exist_ok=True)
-        image_csv_path = os.path.join(save_dir, f"test_image_level_{task_name}.csv")
-        pred_df.to_csv(image_csv_path, index=False)
-        logger.info(f"✅ 已保存逐图像预测结果: {image_csv_path}")
-
-    # ============ patient-level 聚合 (列名带任务前缀) ============
-    patient_gt_col = f"{task_name}_patient_gt"
-    patient_pred_col = f"{task_name}_patient_pred"
-    patient_prob_col = f"{task_name}_patient_prob"
-    patient_nimg_col = f"{task_name}_n_images"
-
-    patient_df = pred_df.groupby("patient_id").agg(
-        **{
-            patient_gt_col: (gt_col, "max"),
-            patient_pred_col: (pred_col, "max"),
-            patient_prob_col: (prob_col, "max"),
-            patient_nimg_col: ("image_path", "count"),
-        }
-    ).reset_index()
-
-    if is_save:
-        patient_csv_path = os.path.join(save_dir, f"test_patient_level_{task_name}.csv")
-        patient_df.to_csv(patient_csv_path, index=False)
-        logger.info(f"✅ 已保存病人级预测结果: {patient_csv_path}")
-
-    # ============ patient-level 指标 ============
-    logger.info(f"patient_df columns = {patient_df.columns.tolist()}")
-
-    y_true = patient_df[patient_gt_col].to_numpy()
-    y_pred = patient_df[patient_pred_col].to_numpy()
-    y_prob = patient_df[patient_prob_col].to_numpy()
-
-    # 过滤掉 gt = -1
-    valid_mask = (y_true != -1)
-    y_true = y_true[valid_mask]
-    y_pred = y_pred[valid_mask]
-    y_prob = y_prob[valid_mask]
-
-    metrics = {}
-
-    if len(y_true) == 0:
-        logger.warning("❗ patient-level: 没有有效标签（全是 -1），无法计算指标")
-        metrics = {
-            f"{task_name}_accuracy": 0.0,
-            f"{task_name}_precision": 0.0,
-            f"{task_name}_recall": 0.0,
-            f"{task_name}_f1": 0.0,
-            f"{task_name}_auroc": float("nan"),
-            f"{task_name}_auprc": float("nan"),
-        }
-        return metrics, pred_df, patient_df
-
-    metrics[f"{task_name}_accuracy"] = float(accuracy_score(y_true, y_pred))
-    metrics[f"{task_name}_precision"] = float(precision_score(y_true, y_pred, zero_division=0))
-    metrics[f"{task_name}_recall"] = float(recall_score(y_true, y_pred, zero_division=0))
-    metrics[f"{task_name}_f1"] = float(f1_score(y_true, y_pred, zero_division=0))
-
-    unique_classes = np.unique(y_true)
-    if len(unique_classes) == 2:
-        metrics[f"{task_name}_auroc"] = float(roc_auc_score(y_true, y_prob))
-        metrics[f"{task_name}_auprc"] = float(average_precision_score(y_true, y_prob))
-    else:
-        logger.warning(
-            f"❗ patient-level: 只有单类 {unique_classes.tolist()}，AUROC/AUPRC 无法计算，设为 NaN"
-        )
-        metrics[f"{task_name}_auroc"] = float("nan")
-        metrics[f"{task_name}_auprc"] = float("nan")
-
-    logger.info(f"========== 病人级 (OR聚合) Test Metrics [{task_name}] ==========")
-    for k, v in metrics.items():
-        if isinstance(v, float):
-            logger.info(f"{k}: {v:.6f}")
-        else:
-            logger.info(f"{k}: {v}")
-
-    return metrics, pred_df, patient_df
+    
