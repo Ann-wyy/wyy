@@ -171,7 +171,7 @@ def train_multi_task_classifier(logger: logging.Logger):
 
         # --- 类别权重 ---
         task_weights = {}
-        num_classes_dict = {task: len(full_df[task].unique()) for task in LABEL_COLUMNS}
+        num_classes_dict = {task: len(full_df[task][full_df[task] != IGNORE_INDEX].unique()) for task in LABEL_COLUMNS}
         for task in LABEL_COLUMNS:
             labels = train_df[task].values
             valid_labels = labels[labels != -1]
