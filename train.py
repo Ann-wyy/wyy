@@ -248,6 +248,7 @@ def train_multi_task_classifier(logger: logging.Logger):
                             probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1) 
                         else:
                             target = valid_labels
+                            task_loss = task_criterion(valid_logits, target)
                             probabilities = torch.softmax(valid_logits , dim=1)
                         loss += task_loss
                         train_labels_all[task].extend(valid_labels.cpu().tolist())
@@ -305,9 +306,8 @@ def train_multi_task_classifier(logger: logging.Logger):
                 'fold': fold_idx,
                 'avg_auroc': checkpoint['best_val_score'],
                 # 如果你想记录每个任务的具体指标，可以从 val_metrics 中提取
-                'task_detail': val_metrics 
+                'task_detail': val_metrics
             })
-        fold_idx += 1
         # ================= 混淆矩阵 =================
 
         model.eval()

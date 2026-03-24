@@ -30,7 +30,6 @@ from collections import defaultdict
 import nibabel as nib
 
 # ================================导入工具函数====================================
-from utils import set_seed, convert_dinov3_teacher_to_hf_state_dict, preprocess_labels_and_setup_datasets
 from metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
 from config import (
     MODEL_TYPE, USE_PRETRAINED, USE_CLINICAL, DEVICE, TARGET_IMAGE_SIZE, BATCH_SIZE, LEARNING_RATE, NUM_EPOCHS,
